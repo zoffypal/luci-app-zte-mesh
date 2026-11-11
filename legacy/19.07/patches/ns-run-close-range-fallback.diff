@@ -1,0 +1,61 @@
+--- a/ns-run.c
++++ b/ns-run.c
+@@ -40,6 +40,45 @@
+     _exit(80);
+ }
+ 
++#ifndef SYS_close_range
++/* close_range(2) arrived in Linux 5.9, and the 4.4 kernel headers of the
++ * 19.07 target do not define the number. The values for the CPUs this
++ * launcher ships, so the syscall can still be tried on a newer kernel. */
++# if defined(__aarch64__)
++#  define SYS_close_range 436
++# elif defined(__arm__)
++#  define SYS_close_range 407
++# elif defined(__x86_64__)
++#  define SYS_close_range 436
++# endif
++#endif
++
++/* Close every inherited descriptor >= 3 so none of them offers an escape to
++ * a host directory or device. Prefer close_range(2); on a kernel older than
++ * Linux 5.9 it answers ENOSYS, and the per-descriptor loop below does the
++ * same job. /proc/self/fd cannot be used for the fallback: this runs after
++ * the chroot, and the private root mounts no /proc. The loop is bounded by
++ * the descriptor limit in force, which is what makes it cheap on a router
++ * (procd starts services with a small RLIMIT_NOFILE); on a host with a huge
++ * limit it still finishes, once per service start. */
++static void close_inherited_fds(void)
++{
++#ifdef SYS_close_range
++    if (syscall(SYS_close_range, 3U, ~0U, 0U) == 0)
++        return;
++    if (errno != ENOSYS)
++        fail("close-inherited-fds");
++#endif
++    {
++        long limit = sysconf(_SC_OPEN_MAX);
++        long fd;
++        if (limit < 0)
++            limit = 1024;
++        for (fd = 3; fd < limit; ++fd)
++            close((int)fd);
++    }
++}
++
+ /* The factory rootfs keeps the usual absolute links: /var/tmp, /var/run and
+  * /var/log all point at /tmp. mount(2) resolves the final component, so a tmpfs
+  * "on <root>/var/tmp" would land on the HOST /tmp instead of inside the sandbox.
+@@ -181,10 +220,8 @@
+     if (syscall(SYS_capset, &header, caps) || prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0))
+         fail("capabilities");
+     /* Existing FDs must not provide an escape to a host directory/device,
+-     * including descriptors >=1024. COMPAT target supports close_range.
+-     */
+-    if (syscall(SYS_close_range, 3U, ~0U, 0U))
+-        fail("close-inherited-fds");
++     * including descriptors >=1024. */
++    close_inherited_fds();
+     {
+         /* Captured before clearenv() wipes the inherited environment. Only this one
+          * named pair survives into the sandbox, and only for the live service: a

@@ -7,6 +7,8 @@ __pycache__/
 *.tar.gz
 # the OpenWrt package builds from this committed runtime
 !/openwrt/zte-mesh/zte-mesh-runtime.tar.gz
+# the legacy 19.07 runtime (glibc rebuilt for kernel 4.4, patched ns-run.c)
+!/legacy/19.07/zte-mesh-runtime-legacy.tar.gz
 # private lab evidence: pcaps, raw DB dumps, logs that may carry WSC/key material
 /evidence/
 *.pcap

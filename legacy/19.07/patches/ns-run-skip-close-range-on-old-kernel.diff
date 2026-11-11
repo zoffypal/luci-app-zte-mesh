@@ -1,0 +1,53 @@
+--- a/ns-run.c
++++ b/ns-run.c
+@@ -15,6 +15,7 @@
+ #include <sys/sysmacros.h>
+ #include <sys/syscall.h>
+ #include <sys/types.h>
++#include <sys/utsname.h>
+ #include <sys/wait.h>
+ #include <time.h>
+ #include <unistd.h>
+@@ -53,6 +54,25 @@
+ # endif
+ #endif
+ 
++/* close_range(2) exists since Linux 5.9. On an older kernel the syscall is
++ * not there at all, and trying it on every start leaves a "syscall 436"
++ * audit line in the log for nothing, so ask uname() first and go straight to
++ * the per-descriptor loop when the kernel predates it. An unparsable release
++ * string, or a failed uname(), means "try it and see" rather than "assume
++ * it is old": the ENOSYS fallback in close_inherited_fds() still covers a
++ * kernel that claims to be new enough but refuses the call (seccomp, or a
++ * build that dropped it). */
++static int kernel_has_close_range(void)
++{
++    struct utsname name;
++    unsigned long major, minor;
++    if (uname(&name) != 0)
++        return 1;
++    if (sscanf(name.release, "%lu.%lu", &major, &minor) != 2)
++        return 1;
++    return major > 5 || (major == 5 && minor >= 9);
++}
++
+ /* Close every inherited descriptor >= 3 so none of them offers an escape to
+  * a host directory or device. Prefer close_range(2); on a kernel older than
+  * Linux 5.9 it answers ENOSYS, and the per-descriptor loop below does the
+@@ -64,10 +84,12 @@
+ static void close_inherited_fds(void)
+ {
+ #ifdef SYS_close_range
+-    if (syscall(SYS_close_range, 3U, ~0U, 0U) == 0)
+-        return;
+-    if (errno != ENOSYS)
+-        fail("close-inherited-fds");
++    if (kernel_has_close_range()) {
++        if (syscall(SYS_close_range, 3U, ~0U, 0U) == 0)
++            return;
++        if (errno != ENOSYS)
++            fail("close-inherited-fds");
++    }
+ #endif
+     {
+         long limit = sysconf(_SC_OPEN_MAX);

@@ -1,0 +1,221 @@
+<%#
+	zte-mesh status, child routers and devices for the 19.07 CBI page.
+	The modern page polls ubus every 5 s; this one reads the same sources
+	once, when the page loads: `ubus call luci.zte-mesh status`, the
+	state.json behind it, and the host-side device list. Node actions are
+	plain links to the controller's node entry (they render a short result
+	and link back here). MAC to address comes from the DHCP leases and the
+	neighbour table, the same two tables the device list merges.
+-%>
+<%-
+local json = require "luci.jsonc"
+local uci = require "luci.model.uci".cursor()
+
+local function call_json(cmd)
+	local f = io.popen(cmd .. " 2>/dev/null")
+	if not f then return nil end
+	local out = f:read("*a")
+	f:close()
+	if not out or out == "" then return nil end
+	return json.parse(out)
+end
+
+local info = call_json("ubus call luci.zte-mesh status") or {}
+local state = info.state
+local devices = call_json("/usr/libexec/zte-mesh/device-list") or {}
+local list = devices.devices or {}
+
+local aliases = {}
+uci:foreach("zte_mesh", "zte_mesh_node", function(sec)
+	if sec.mac and sec.name then
+		aliases[sec.mac:lower()] = sec.name
+	end
+end)
+
+-- MAC -> address, from the DHCP leases first, then the neighbour table.
+local addrs = {}
+local f = io.open("/tmp/dhcp.leases", "r")
+if f then
+	for line in f:lines() do
+		local mac, ip = line:match("^%S+ (%x%x:%x%x:%x%x:%x%x:%x%x:%x%x) (%S+)")
+		if mac and ip then addrs[mac:lower()] = ip end
+	end
+	f:close()
+end
+f = io.open("/proc/net/arp", "r")
+if f then
+	for line in f:lines() do
+		local ip, mac = line:match("^(%S+)%s+%S+%s+%S+%s+(%x%x:%x%x:%x%x:%x%x:%x%x:%x%x)")
+		if ip and mac and not addrs[mac:lower()] then addrs[mac:lower()] = ip end
+	end
+	f:close()
+end
+
+local function addr_of(mac)
+	return mac and addrs[(mac or ""):lower()] or nil
+end
+
+local function badge(text, color)
+	return string.format('<span class="ifacebadge" style="background:%s">%s</span>',
+		color, pcdata(text))
+end
+
+local child = info.role == "slave"
+local is_local = info["local"] == true
+local stale = not info.age or info.age < 0 or info.age > 10
+local running = info.running and state and state.running and not stale
+local now = os.time()
+-%>
+
+<% if not info.installed then %>
+	<div class="alert-message warning"><%=translate("The ZTE Mesh runtime is not installed on this router.")%></div>
+<% else %>
+	<div class="table">
+		<div class="tr"><div class="td left" style="width:33%"><%=translate(child and "Child router" or is_local and "Main router" or "Controller")%></div>
+		<div class="td left"><%=
+			running and badge(translate("Running"), "#46a546") or
+			(info.running and badge(translate("Starting or stalled"), "#b94a48") or badge(translate("Stopped"), "#b94a48"))
+		%></div></div>
+		<% if child then %>
+		<div class="tr"><div class="td left"><%=translate("Device role")%></div><div class="td left"><%=translate("Child router, managed by the controller")%></div></div>
+		<% elseif not is_local then %>
+		<div class="tr"><div class="td left"><%=translate("Device role")%></div><div class="td left"><%=translate("Controller only: this router's own radios are not managed here")%></div></div>
+		<% end %>
+		<% if state and state.running then %>
+		<div class="tr"><div class="td left"><%=translate("Controller address (AL MAC)")%></div><div class="td left"><%=pcdata(state.al_mac or "-")%></div></div>
+		<% if state.self then %>
+		<div class="tr"><div class="td left"><%=translate("Model")%></div><div class="td left"><%=pcdata(state.self.model or "-")%></div></div>
+		<div class="tr"><div class="td left"><%=translate("Host name")%></div><div class="td left"><%=pcdata(state.self.name or "router")%></div></div>
+		<% end %>
+		<% if not child then %>
+		<div class="tr"><div class="td left"><%=translate("MESH compatible")%></div><div class="td left"><%=
+			(uci:get("zte_mesh", "main", "mesh_compatible") == "0") and translate("Off (ZTE enhanced)") or translate("On (ZTE compatible)")
+		%></div></div>
+		<div class="tr"><div class="td left"><%=translate("Wi-Fi updates sent")%></div><div class="td left"><%=pcdata(tostring(state.config_applied or 0))%></div></div>
+		<% end %>
+		<div class="tr"><div class="td left"><%=translate("Wired port")%></div><div class="td left"><%=
+			info.attached and badge(translate("Attached to the LAN bridge"), "#46a546") or badge(translate("Not attached"), "#b94a48")
+		%></div></div>
+		<% if state.clients and #state.clients > 0 then %>
+		<div class="tr"><div class="td left"><%=translate("Device actions")%></div><div class="td left"><%-
+			local parts = {}
+			for _, c in ipairs(state.clients) do
+				local how = c.state == "done" and translate("done")
+					or c.state == "failed" and translate("the router refused or did not answer")
+					or c.state == "expired" and translate("ran out")
+					or c.state == "pending" and translate("queued")
+					or translate("sent")
+				local left = (c.left and c.left > 0) and (" · " .. translate("%d min left"):format(math.ceil(c.left / 60))) or ""
+				parts[#parts+1] = pcdata(c.mac) .. ": " ..
+					(c.action == "ban" and translate("Blocked") or translate("Kicked")) .. ", " .. how .. left
+			end
+		-%><%=table.concat(parts, "; ")%></div></div>
+		<% end %>
+		<% end %>
+		<% if (child or is_local) and info.sync then %>
+		<div class="tr"><div class="td left"><%=translate("Wi-Fi synchronisation")%></div><div class="td left"><%=
+			info.sync.result == "ok" and badge(translate("Applied"), "#46a546") or badge(translate("Failed"), "#b94a48")
+		%><% if info.sync.epoch and info.sync.epoch > 0 then %> <%=translate("%d s ago"):format(math.max(0, now - info.sync.epoch))%><% end %><% if info.sync.bands and info.sync.bands ~= "" then %> · <%=pcdata(info.sync.bands)%><% end %><% if info.sync.message and info.sync.message ~= "" then %> · <%=pcdata(info.sync.message)%><% end %></div></div>
+		<% end %>
+		<% if state and state.config_error then %>
+		<div class="tr"><div class="td left"><%=translate("Last configuration problem")%></div><div class="td left"><span style="color:#b94a48"><%=pcdata(state.config_error)%></span></div></div>
+		<% end %>
+		<% if state and state.restart_required then %>
+		<div class="tr"><div class="td left"><%=translate("Pending")%></div><div class="td left"><%=translate("A setting changed that the controller reads only at start; restart the controller to apply it.")%></div></div>
+		<% end %>
+		<% if stale and info.running then %>
+		<div class="tr"><div class="td left"><%=translate("Report")%></div><div class="td left"><%=translate("No fresh status for %d s"):format(info.age)%></div></div>
+		<% end %>
+	</div>
+<% end %>
+
+<% if not child then %>
+	<h3><%=translate("Child routers")%></h3>
+	<table class="table cbi-section-table">
+		<tr class="tr table-titles">
+			<th class="th"><%=translate("Name")%></th>
+			<th class="th"><%=translate("Model")%></th>
+			<th class="th"><%=translate("Address")%></th>
+			<th class="th"><%=translate("MAC")%></th>
+			<th class="th"><%=translate("Software")%></th>
+			<th class="th"><%=translate("Type")%></th>
+			<th class="th"><%=translate("Light")%></th>
+			<th class="th"><%=translate("Clients")%></th>
+			<th class="th"><%=translate("BSS detail")%></th>
+			<th class="th"><%=translate("Link")%></th>
+			<th class="th"><%=translate("State")%></th>
+			<th class="th"><%=translate("Actions")%></th>
+		</tr>
+		<% local nodes = (state and state.nodes) or {} %>
+		<% for _, node in ipairs(nodes) do %>
+		<% local ip = addr_of(node.mac) %>
+		<% local title = aliases[(node.mac or ""):lower()] or node.name or node.model or node.mac %>
+		<tr class="tr">
+			<td class="td"><%=pcdata(title)%></td>
+			<td class="td"><%=pcdata(node.model or "-")%></td>
+			<td class="td"><% if ip then %><a href="http://<%=pcdata(ip)%>/" target="_blank" rel="noreferrer"><%=pcdata(ip)%></a><% else %>-<% end %></td>
+			<td class="td"><%=pcdata(node.mac)%></td>
+			<td class="td"><%=pcdata(node.software or "-")%></td>
+			<td class="td"><%=node.zte and "ZTE" or translate("Standard")%></td>
+			<td class="td"><%=node.light == 1 and translate("On") or (node.light == 0 and translate("Off") or "-")%></td>
+			<td class="td" title="<% if node.bss and node.bss >= 0 then %><%=translate("%d BSS reported by the router"):format(node.bss)%><% end %>"><%=node.online and node.stations and node.stations >= 0 and tostring(node.stations) or "-"%></td>
+			<td class="td"><% if node.bss_detail and #node.bss_detail > 0 then %><div class="small"><% for _, b in ipairs(node.bss_detail) do %><div title="<% if b.age and b.age >= 0 then %><%=translate("%d s ago"):format(b.age)%><% end %>"><%=pcdata(b.bssid)%> <%=pcdata(tostring(b.stations))%></div><% end %></div><% else %>-<% end %></td>
+			<td class="td" title="<% if node.metrics_age and node.metrics_age >= 0 then %><%=translate("%d s ago"):format(node.metrics_age)%><% end %>"><%=node.hops == 1 and translate("Direct") or (node.hops == 2 and translate("Relayed") or "-")%></td>
+			<td class="td"><%=node.online and badge(translate("Online"), "#46a546") or badge(translate("Offline"), "#999")%></td>
+			<td class="td"><% if node.online and node.zte then %>
+				<a class="btn cbi-button cbi-button-negative" href="node?mac=<%=pcdata(node.mac)%>&amp;op=reboot" onclick="return confirm('<%=translate("Restart %s? Its Wi-Fi and the devices connected through it are offline for a few minutes."):format(node.mac)%>')"><%=translate("Restart")%></a>
+				<a class="btn cbi-button" href="node?mac=<%=pcdata(node.mac)%>&amp;op=light&amp;on=1"><%=translate("Light on")%></a>
+				<a class="btn cbi-button" href="node?mac=<%=pcdata(node.mac)%>&amp;op=light&amp;on=0"><%=translate("Light off")%></a>
+			<% else %>-<% end %></td>
+		</tr>
+		<% end %>
+		<% if #nodes == 0 then %>
+		<tr class="tr placeholder"><td class="td" colspan="12"><em><%=translate("No child routers have been discovered yet.")%></em></td></tr>
+		<% end %>
+	</table>
+<% end %>
+
+<h3><%=translate("Devices")%></h3>
+<div class="small"><%=translate("What this router can see itself: its DHCP leases, the neighbour table and the stations on its own access points. A device attached to another router of the mesh is not here, because the controller learns a station count per network and not which stations those are.")%></div>
+<table class="table cbi-section-table">
+	<tr class="tr table-titles">
+		<th class="th"><%=translate("Device")%></th>
+		<th class="th"><%=translate("MAC")%></th>
+		<th class="th"><%=translate("Address")%></th>
+		<th class="th"><%=translate("Position")%></th>
+		<th class="th"><%=translate("Node")%></th>
+		<th class="th"><%=translate("Seen by")%></th>
+		<th class="th"><%=translate("Lease")%></th>
+		<th class="th"><%=translate("Note")%></th>
+	</tr>
+	<% local count = 0 %>
+	<% for _, d in ipairs(list) do %>
+	<% count = count + 1 %>
+	<% local ip = (d.ip and d.ip ~= "-") and d.ip or "" %>
+	<% local sources = {} %>
+	<% for s in (d.sources or ""):gmatch("%S+") do %>
+		<% if s == "lease" then sources[#sources+1] = translate("DHCP lease")
+		elseif s == "neigh" then sources[#sources+1] = translate("Neighbour table")
+		elseif s == "wlan" then sources[#sources+1] = translate("Wireless association")
+		elseif s == "assoc" then sources[#sources+1] = translate("Child router report") end %>
+	<% end %>
+	<% local lease = "-" %>
+	<% if d.lease_end and d.lease_end > 0 then local left = d.lease_end - now lease = left > 0 and translate("%d min left"):format(math.ceil(left / 60)) or translate("Expired") end %>
+	<% local nodes = (state and state.nodes) or {} %>
+	<% local titles = {} %>
+	<% for _, n in ipairs(nodes) do titles[(n.mac or ""):lower()] = aliases[(n.mac or ""):lower()] or n.name or n.model or n.mac end %>
+	<tr class="tr">
+		<td class="td"><%=pcdata(d.name or "-")%></td>
+		<td class="td"><%=pcdata(d.mac)%></td>
+		<td class="td"><% if ip ~= "" then %><a href="http://<%=pcdata(ip)%>/" target="_blank" rel="noreferrer"><%=pcdata(ip)%></a><% else %>-<% end %></td>
+		<td class="td" title="<%=pcdata(d.iface or "")%>"><% if d.ssid and d.ssid ~= "" then %><span class="ifacebadge"><%=pcdata(d.ssid)%></span><% elseif d.iface and d.iface ~= "" then %><span class="ifacebadge"><%=pcdata(d.iface)%></span><% elseif d.via then %><%=translate("Wireless")%><% else %><%=translate("Wired")%><% end %></td>
+		<td class="td" title="<%=pcdata(d.via or "")%>"><%=d.via and pcdata(titles[(d.via or ""):lower()] or d.via) or "-"%></td>
+		<td class="td"><%=#sources > 0 and table.concat(sources, ", ") or "-"%></td>
+		<td class="td"><%=pcdata(lease)%></td>
+		<td class="td"><%=d.node and badge(translate("Child router")) or "-"%></td>
+	</tr>
+	<% end %>
+	<% if count == 0 then %>
+	<tr class="tr placeholder"><td class="td" colspan="8"><em><%=translate("Nothing here yet: this router has no DHCP lease, no neighbour entry and no station on its access points.")%></em></td></tr>
+	<% end %>
+</table>

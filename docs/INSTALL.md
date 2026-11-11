@@ -62,6 +62,8 @@ ssh root@<这台路由器的IP> 'apk add --allow-untrusted /tmp/zte-apk/zte-mesh
 
 **编进固件**（长期用这台机器当控制器时更省事）：把本仓库当 feed 加进 ImmortalWrt 树，`./scripts/feeds update zte_mesh && ./scripts/feeds install -a -p zte_mesh`，`.config` 里勾上 `CONFIG_PACKAGE_{zte-mesh,luci-app-zte-mesh,luci-i18n-zte-mesh-zh-cn}=m`。feed 登记与编译命令见 [DEVELOPMENT](DEVELOPMENT.md) 第 8 节。这样出来的启动器只带**这棵树正在构建的那种架构 CPU**（构建树里只有目标机的工具链；另外两种架构要宿主的 `gcc-aarch64-linux-gnu` / `gcc-arm-linux-gnueabihf` 在场，CI 那次就是这么装的）。这不是问题——apk 装到哪台机器都收，包不带的架构由入口脚本在运行时说清楚，`ZTE_MESH_ARCHES` / `ZTE_MESH_REQUIRE_ARCHES` 可以分别限定"编哪几种架构"和"缺了哪种架构就报错"。
 
+- **老 release（19.07，opkg/ipk）**：上面那条路只管新版 ImmortalWrt。还跑 19.07 的机器（例如 QWRT R24.5.1，内核 4.4.60）用 ipk：Actions → **Build packages (apk + legacy ipk)** → Run workflow，产物是 `zte-mesh-ipk-19.07` artifact（三个 ipk + `SHA256SUMS.txt`），装机与验证步骤见 [legacy/19.07/README.md](../legacy/19.07/README.md)。差别只在运行包与 LuCI 页面：glibc 2.26 按 `--enable-kernel=4.4.0` 重编、Lua 页面代替 JS 页面、`ns-run` 在 4.4 上不调 `close_range()`；主树那份运行包与 JS 页面原样保留。
+
 ## 3. 打开页面并确认服务起来了
 
 1. LuCI 登录 → **网络 → ZTE Mesh**（页面标题 `ZTE Mesh`，中文版是「中兴组网」）；「常规」tab 最上面是**启用**（默认开）与服务状态——状态框会写这台机器现在的角色和有没有在跑。
