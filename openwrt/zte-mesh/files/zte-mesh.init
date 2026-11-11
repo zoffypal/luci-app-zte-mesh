@@ -846,6 +846,29 @@ launcher_ready() {
 	return 0
 }
 
+# The loader is the first thing that touches the vendor binaries, and the only
+# thing that can tell the kernel from the runtime: CONFIG_COMPAT=y says the
+# kernel can run ARM32 at all, but the private glibc was built for a minimum
+# kernel of its own -- the vendor's was 5.4.0, and this package rebuilds it
+# for 4.4.0 -- and a loader that refuses the kernel answers "FATAL: kernel too
+# old" and exits 127. Ask it here, with --list, which loads every NEEDED
+# library and resolves its symbols without starting the daemon: a failure
+# names the binary and the loader's own reason, and the service does not
+# start, instead of procd respawning a 127 every five seconds. The emulator
+# path is passed in because the lab runs the loader under qemu, where this
+# host cannot execute it directly, so a set emulator skips this check.
+runtime_ready() {
+	local prog prog_out prog_status
+	[ -n "$1" ] && return 0
+	[ -x "$ROOT/lib/ld-linux.so.3" ] || { log "the private ARM32 loader $ROOT/lib/ld-linux.so.3 is missing from package zte-mesh"; return 1; }
+	for prog in db-engine-probe multiapd zte-meshctl; do
+		prog_status=0
+		prog_out=$("$ROOT/lib/ld-linux.so.3" --library-path "$ROOT/lib" --list "$ROOT/bin/$prog" 2>&1) || prog_status=$?
+		[ "$prog_status" = 0 ] || { log "the private ARM32 runtime cannot load $ROOT/bin/$prog (loader exit $prog_status): $prog_out"; return 1; }
+	done
+	return 0
+}
+
 # The model this router advertises as its 1905 identity. A real ZTE child checks the vendor and market code
 # (REAL_CHILD.md section 2), not this string; the page and the controller list show it as the broadcasting node's
 # model, so it follows what the radios are: no radio -> ZXSLC SR1010, Wi-Fi 5 -> ZXHN Z506, Wi-Fi 6 -> ZXHN E2631,
@@ -1024,6 +1047,8 @@ start_service() {
 	fi
 	emulated=""
 	[ -n "$emulator" ] && emulated="ZTE_MESH_EMULATED_LAB=1 ZTE_MESH_QEMU=$emulator"
+
+	runtime_ready "$emulator" || return 1
 
 	procd_open_instance controller
 	procd_set_param command "$NSRUN" "$ROOT" /lib/ld-linux.so.3 --library-path /lib /bin/db-engine-probe --controller-service
