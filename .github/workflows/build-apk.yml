@@ -81,6 +81,10 @@ name: Build APK
 
 on:
   workflow_dispatch:
+  # Reusable as well: build-packages.yml calls this workflow so one manual
+  # run can produce both the apk and the legacy 19.07 ipk. A direct
+  # dispatch of this workflow still works exactly as before.
+  workflow_call:
 
 # Read-only on purpose: nothing here writes to the repository or to releases.
 permissions:

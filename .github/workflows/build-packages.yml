@@ -1,0 +1,396 @@
+name: Build packages (apk + legacy ipk)
+
+# One manual entry point for both package formats.
+#
+#  * apk: the new-format packages for current ImmortalWrt, built by the
+#    existing build-apk.yml. That workflow is reused here through
+#    workflow_call (the trigger was added to it for this; a direct dispatch
+#    of build-apk.yml still works exactly as before).
+#  * ipk: the same feed built against the OpenWrt 19.07.10 SDK, for the
+#    machines that still use opkg/ipk -- currently the QWRT R24.5.1
+#    (JDCloud AX1800 Pro, kernel 4.4.60). The legacy overlay
+#    (legacy/19.07/) is applied in the checkout only, never committed into
+#    the main tree: the rebuilt glibc 2.26 runtime tarball, the Lua LuCI
+#    pages, and the runtime-dep trim that build-apk.yml also does for its
+#    own target.
+#
+# Trigger: manual only (workflow_dispatch). Pushes never build, same rule
+# as the other workflows in this repository.
+#
+# This workflow does NOT publish releases. Download the artifact, install
+# it on the target machine, and only then `gh release create` if it holds.
+# The version built is the committed PKG_RELEASE in the two Makefiles; to
+# ship a new version, bump those two lines and run this workflow again.
+
+on:
+  workflow_dispatch:
+    inputs:
+      build_apk:
+        description: 'Build the new-format .apk packages'
+        type: boolean
+        default: true
+      build_ipk:
+        description: 'Build the legacy OpenWrt 19.07 .ipk packages'
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+# A superseded run is worthless: cancel the old one instead of paying for
+# two full toolchain builds in parallel (and fighting over the same cache
+# key).
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  apk:
+    name: apk (current ImmortalWrt)
+    if: ${{ inputs.build_apk }}
+    uses: ./.github/workflows/build-apk.yml
+
+  ipk:
+    name: ipk (legacy OpenWrt 19.07)
+    if: ${{ inputs.build_ipk }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+
+    steps:
+      - name: Check out this feed
+        uses: actions/checkout@v4
+        with:
+          path: zte-mesh
+          fetch-depth: 0
+
+      - name: Resolve the apt package list and cache key
+        id: aptlist
+        run: |
+          set -eu -o pipefail
+          # Same shape as build-apk.yml: one file holds the list, so the
+          # cache key and the install read the same bytes. On top of that
+          # list this job needs the armv7 hard-float cross compiler (the
+          # armv7 launcher), musl-gcc (the x86_64 launcher), qemu-user-static
+          # (the --list check at the end runs the ARM32 loader under it) and
+          # lua5.1 (luac syntax-checks the legacy Lua pages).
+          cat > "$RUNNER_TEMP/apt-packages" <<'PKGS'
+          build-essential gawk unzip file wget python3
+          rsync subversion git zstd libncurses-dev
+          swig libssl-dev python3-dev lua5.1 liblua5.1-0-dev
+          xz-utils bc flex bison gettext zlib1g-dev libelf-dev
+          gcc-arm-linux-gnueabihf libc6-dev-armhf-cross
+          linux-libc-dev musl-tools musl-dev
+          qemu-user-static patch
+          PKGS
+          { tr -s '[:space:]' '\n' < "$RUNNER_TEMP/apt-packages" | sed '/^$/d' | sort
+            echo "os=${ImageOS:-unknown}"
+            echo "image=$(cat /image_version 2>/dev/null || echo unknown)"
+          } > "$RUNNER_TEMP/apt-key"
+          echo "hash=$(sha256sum "$RUNNER_TEMP/apt-key" | cut -c1-16)" >> "$GITHUB_OUTPUT"
+
+      - name: Restore the apt download cache
+        id: aptcache
+        uses: actions/cache/restore@v4
+        with:
+          path: ${{ runner.temp }}/apt/archives
+          key: apt-ipk-${{ steps.aptlist.outputs.hash }}
+
+      - name: Install host dependencies
+        run: |
+          set -eu -o pipefail
+          sudo mkdir -p "$RUNNER_TEMP/apt/archives/partial"
+          sudo chown -R "$(id -u):$(id -g)" "$RUNNER_TEMP/apt"
+          sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=20 update
+          tr -s '[:space:]' '\n' < "$RUNNER_TEMP/apt-packages" | sed '/^$/d' \
+            | xargs -r -x sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=20 \
+                 -o Dir::Cache::archives="$RUNNER_TEMP/apt/archives/" install -y --no-install-recommends
+          sudo chown -R "$(id -u):$(id -g)" "$RUNNER_TEMP/apt"
+          echo "cached debs: $(ls -1 "$RUNNER_TEMP/apt/archives"/*.deb 2>/dev/null | wc -l), $(du -sh "$RUNNER_TEMP/apt/archives" | cut -f1)"
+
+      - name: Save the apt download cache
+        if: steps.aptcache.outputs.cache-hit != 'true'
+        continue-on-error: true
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ runner.temp }}/apt/archives
+          key: apt-ipk-${{ steps.aptlist.outputs.hash }}
+
+      - name: Download the OpenWrt 19.07.10 SDK
+        run: |
+          set -eu -o pipefail
+          # armvirt/64: 19.07 has no ipq807x target, and the SDK's aarch64
+          # toolchain is what builds the aarch64 launcher. The tarball hash
+          # is the one published in the release's sha256sums file.
+          SDK_URL="https://downloads.openwrt.org/releases/19.07.10/targets/armvirt/64/openwrt-sdk-19.07.10-armvirt-64_gcc-7.5.0_musl.Linux-x86_64.tar.xz"
+          SDK_SHA256="e01df53cfb2e0b0be800301b82630b815c0da4de08ed880b130b32788ad94311"
+          curl -L --retry 3 -o sdk.tar.xz "$SDK_URL"
+          echo "$SDK_SHA256  sdk.tar.xz" | sha256sum -c -
+          mkdir -p openwrt-19.07
+          tar -C openwrt-19.07 --strip-components=1 -xf sdk.tar.xz
+          test -f openwrt-19.07/Makefile || { echo "SDK extract incomplete" >&2; exit 1; }
+
+      - name: Apply the legacy 19.07 overlay
+        run: |
+          set -eu -o pipefail
+          # Everything in this step changes the checkout only: the main tree
+          # keeps the modern runtime tarball and the JS LuCI pages, and the
+          # apk job never sees these files.
+          #
+          # 1. The legacy runtime tarball: glibc 2.26 rebuilt for a minimum
+          #    kernel of 4.4.0 plus the patched ns-run.c (see
+          #    legacy/19.07/README.md for provenance and the on-device
+          #    verification). The zte-mesh Makefile unpacks whatever tarball
+          #    stands at this path, so swapping the file swaps the runtime.
+          cp zte-mesh/legacy/19.07/zte-mesh-runtime-legacy.tar.gz \
+             zte-mesh/openwrt/zte-mesh/zte-mesh-runtime.tar.gz
+          # 2. The Lua LuCI pages: 19.07's dispatcher only scans Lua
+          #    controllers and never reads menu.d, so the JS view and the
+          #    menu entry go away and luasrc/ takes their place. The .po
+          #    translations and the rpcd acl stay untouched.
+          rm -rf zte-mesh/openwrt/luci-app-zte-mesh/htdocs \
+                 zte-mesh/openwrt/luci-app-zte-mesh/root/usr/share/luci
+          cp -r zte-mesh/legacy/19.07/luasrc zte-mesh/openwrt/luci-app-zte-mesh/luasrc
+          test -f zte-mesh/openwrt/luci-app-zte-mesh/luasrc/controller/zte-mesh.lua || {
+            echo "legacy Lua controller did not land" >&2; exit 1; }
+          # 3. Syntax-check the Lua pages now, with the same Lua 5.1 the
+          #    19.07 LuCI runs. The two .lua files go through luac; the
+          #    .htm template is not pure Lua (it is HTML with <% %> blocks),
+          #    so it gets the two checks that have actually bitten this
+          #    page: template markers balanced, and no reserved word used
+          #    as a field name (`info.local` is a syntax error in Lua 5.1,
+          #    it must be `info["local"]`).
+          for f in zte-mesh/openwrt/luci-app-zte-mesh/luasrc/controller/zte-mesh.lua \
+                   zte-mesh/openwrt/luci-app-zte-mesh/luasrc/model/cbi/zte-mesh.lua; do
+            luac5.1 -p "$f" || { echo "luac failed: $f" >&2; exit 1; }
+          done
+          HTM=zte-mesh/openwrt/luci-app-zte-mesh/luasrc/view/zte-mesh/status.htm
+          [ "$(grep -o '<%' "$HTM" | wc -l)" = "$(grep -o '%>' "$HTM" | wc -l)" ] || {
+            echo "unbalanced <% %> in $HTM" >&2; exit 1; }
+          if grep -nE '\.(local|function|end|repeat|until|then|else|elseif|do|while|for|in|if|return|break|and|or|not|nil|true|false)\b' "$HTM"; then
+            echo "reserved word used as a field name in $HTM (Lua 5.1)" >&2; exit 1; fi
+          echo "legacy Lua pages pass luac5.1"
+          # 4. Runtime deps: the 19.07 SDK has no kernel tree for this
+          #    target in the feed, so +ip-full/+kmod-veth/+kmod-sched-core
+          #    move out of DEPENDS and into EXTRA_DEPENDS -- the same shape
+          #    build-apk.yml uses for its target. package-ipkg.mk still
+          #    writes them into the ipk's Depends, opkg still enforces them
+          #    at install time, but the build never tries to compile a
+          #    kernel module or iproute2.
+          MK=zte-mesh/openwrt/zte-mesh/Makefile
+          echo "before: $(grep -n 'DEPENDS' "$MK")"
+          sed -i -E 's/[[:space:]]*\+ip-full//g' "$MK"
+          sed -i -E 's/[[:space:]]*\+(kmod-veth|kmod-sched-core)//g' "$MK"
+          sed -i -E "s|^([[:space:]]*DEPENDS:=.*)$|\1\n  EXTRA_DEPENDS:=ip-full (>=0), kmod-veth (>=0), kmod-sched-core (>=0)|" "$MK"
+          echo "after:  $(grep -n 'DEPENDS' "$MK")"
+          if grep -E '^[[:space:]]*DEPENDS:=' "$MK" | grep -qE '\+(kmod-veth|kmod-sched-core|ip-full)'; then
+            echo "runtime deps were not trimmed properly in $MK" >&2; exit 1; fi
+          grep -n '^PKG_RELEASE' zte-mesh/openwrt/zte-mesh/Makefile \
+                 zte-mesh/openwrt/luci-app-zte-mesh/Makefile
+
+      - name: Install feeds
+        working-directory: openwrt-19.07
+        run: |
+          set -eu -o pipefail
+          # Do NOT write feeds.conf from scratch: a bare `> feeds.conf`
+          # drops packages/luci/routing/telephony, and then
+          # `package/feeds/luci/luci-base/compile` has no rule at all.
+          # Start from the SDK's own list and only add this feed.
+          grep -vE '^[[:space:]]*src-(git|link|cdns|hg|svn|bzr)[[:space:]]+zte_mesh([[:space:]]|$)' \
+            feeds.conf.default > feeds.conf
+          FEED_DIR="$(cd ../zte-mesh/openwrt && pwd)"
+          printf 'src-link zte_mesh %s\n' "$FEED_DIR" >> feeds.conf
+          cat feeds.conf
+          ./scripts/feeds update -a
+          ./scripts/feeds install -a
+          test -f package/feeds/zte_mesh/zte-mesh/Makefile || {
+            echo "zte_mesh feed not linked into package/feeds" >&2; exit 1; }
+          test -f package/feeds/luci/luci-base/Makefile || {
+            echo "luci feed missing: package/feeds/luci/luci-base" >&2; exit 1; }
+          echo "feeds ok: $(ls package/feeds)"
+
+      - name: Configure target
+        working-directory: openwrt-19.07
+        run: |
+          set -eu -o pipefail
+          cat >> .config <<EOF
+          CONFIG_TARGET_armvirt=y
+          CONFIG_TARGET_armvirt_64=y
+          CONFIG_TARGET_armvirt_64_Default=y
+          CONFIG_PACKAGE_zte-mesh=m
+          CONFIG_PACKAGE_luci-app-zte-mesh=m
+          CONFIG_PACKAGE_luci-i18n-zte-mesh-zh-cn=m
+          EOF
+          rm -f tmp/.packageinfo tmp/.config-package.in feeds/zte_mesh.index
+          ./scripts/feeds update zte_mesh >/dev/null
+          ./scripts/feeds install -a -p zte_mesh
+          make defconfig
+          grep -q '^CONFIG_PACKAGE_zte-mesh=m' .config || {
+            echo "zte-mesh fell out of the package index (its DEPENDS or Makefile changed?)" >&2
+            ls package/feeds/zte_mesh/ >&2
+            exit 1; }
+          # The translations are a *virtual* package: luci.mk turns
+          # po/zh_Hans/ into luci-i18n-zte-mesh-zh-cn, which owns no
+          # directory, so it can only be emitted by compiling its parent
+          # directory -- and only while it is selected in .config.
+          if grep -qs 'luci-i18n-zte-mesh-zh-cn' .config-package.in tmp/.config-package.in; then
+            grep -q '^CONFIG_PACKAGE_luci-i18n-zte-mesh-zh-cn=' .config ||
+              printf 'CONFIG_PACKAGE_luci-i18n-zte-mesh-zh-cn=m\n' >> .config
+            grep -E '^CONFIG_PACKAGE_luci-i18n-zte-mesh-zh-cn=' .config
+          else
+            echo "luci.mk produced no luci-i18n-zte-mesh-zh-cn package:" >&2
+            echo "  po/ as the feed sees it: $(ls package/feeds/zte_mesh/luci-app-zte-mesh/po 2>&1 | tr '\n' ' ')" >&2
+            exit 1
+          fi
+          grep -n -E 'CONFIG_(TARGET_armvirt|PACKAGE_zte-mesh|PACKAGE_luci-app-zte-mesh)' .config
+
+      - name: Install host tools and target toolchain
+        working-directory: openwrt-19.07
+        run: |
+          set -eu -o pipefail
+          # The SDK ships the target toolchain, but the host tools it needs
+          # (and the toolchain's own install stamps) are built here.
+          start=$(date +%s)
+          make -j"$(nproc)" V=s tools/install toolchain/install 2>&1 | tee "$RUNNER_TEMP/tools-install.log"
+          echo "tools+toolchain: $(( $(date +%s) - start ))s"
+
+      - name: Build packages
+        working-directory: openwrt-19.07
+        run: |
+          set -eu -o pipefail
+          # 19.07's prereq check wants Python 2, which Ubuntu 24.04 does
+          # not ship. The stamp below is what that check writes when it
+          # passes; touching it (plus FORCE=1) skips a check for a
+          # toolchain that is already known-good, the same bypass the
+          # local 19.07 builds use.
+          mkdir -p staging_dir/host
+          touch staging_dir/host/.prereq-build
+          # The exec environment's umask is 0007 and the SDK's prereq
+          # check wants 022; /home is overlayfs, so `cp -p` on a tarball
+          # member owned by another uid fails -- CP="cp -fR" works around
+          # both without touching the SDK.
+          umask 022
+          LOG="$GITHUB_WORKSPACE/build-ipk.log"
+          : > "$LOG"
+          # luci-base first: luci.mk needs the host po2lmo before it can
+          # build luci-app-zte-mesh and its zh-cn translations.
+          make -j"$(nproc)" V=s package/feeds/luci/luci-base/compile >>"$LOG" 2>&1
+          # The launcher build script lives at the top of this repository,
+          # not in the feed: the Makefile says so instead of letting `sh`
+          # fail on an empty argument, so point it at the checkout.
+          # ZTE_MESH_REQUIRE_ARCHES turns a silently missing architecture
+          # into a red run.
+          make -j"$(nproc)" V=s package/zte-mesh/compile package/luci-app-zte-mesh/compile \
+            ZTE_MESH_REQUIRE_ARCHES="aarch64 armv7 x86_64" \
+            ZTE_MESH_LAUNCHER_BUILD="$GITHUB_WORKSPACE/zte-mesh/tools/build/launcher-arches.sh" \
+            FORCE=1 CP="cp -fR" >>"$LOG" 2>&1
+          for stem in zte-mesh luci-app-zte-mesh luci-i18n-zte-mesh-zh-cn; do
+            test -n "$(find bin -name "$stem"_[0-9]*.ipk -print -quit)" || {
+              echo "build reported success but produced no $stem ipk" >&2
+              tail -40 "$LOG" >&2
+              exit 1; }
+          done
+          find bin -name '*zte-mesh*.ipk' | tee -a "$LOG"
+
+      - name: Locate artifacts
+        id: collect
+        run: |
+          set -eu -o pipefail
+          # zte-mesh lands under bin/targets/armvirt/64/packages/, the two
+          # LuCI packages under bin/packages/aarch64_generic/zte_mesh/; the
+          # find covers both. Note the `_` after the stem: an ipk is named
+          # `zte-mesh_0.1.0-29_all.ipk`, unlike an apk's `zte-mesh-0.1.0-r29.apk`,
+          # so the apk workflow's `stem-[0-9]*` glob matches nothing here.
+          mkdir -p dist
+          find openwrt-19.07/bin -name 'zte-mesh_[0-9]*.ipk' -exec cp -v {} dist/ \;
+          find openwrt-19.07/bin -name 'luci-*zte-mesh*.ipk' -exec cp -v {} dist/ \;
+          ls -la dist
+
+      - name: Write checksums
+        working-directory: dist
+        run: sha256sum *.ipk | tee SHA256SUMS.txt
+
+      - name: Upload packages
+        uses: actions/upload-artifact@v4
+        with:
+          name: zte-mesh-ipk-19.07
+          path: dist/
+          if-no-files-found: error
+
+      # This sits after the upload on purpose: a broken judgement costs a
+      # red run, not a lost batch (same rule as build-apk.yml).
+      - name: Verify the ipk carries the legacy runtime
+        run: |
+          set -eu -o pipefail
+          # A 19.07 ipk is a gzipped tar of control.tar.gz + data.tar.gz.
+          # Read the members, not the exit code: a build that silently
+          # shipped the modern runtime (glibc for kernel 5.4) or the JS
+          # pages would install fine and fail on the 4.4 router exactly
+          # the way r28 did.
+          rm -rf verify && mkdir -p verify
+          MESH_IPK=$(find dist -name 'zte-mesh_[0-9]*.ipk' | head -1)
+          test -n "$MESH_IPK" || { echo "no zte-mesh ipk to read" >&2; exit 1; }
+          ( cd verify && tar -xzf "../$MESH_IPK" && tar -xzf control.tar.gz && tar -xzf data.tar.gz )
+          echo "--- control ---"
+          cat verify/control
+          grep -q '^Version: 0.1.0-' verify/control || { echo "unexpected Version in control" >&2; exit 1; }
+          for dep in ip-full kmod-veth kmod-sched-core; do
+            grep -q "$dep" verify/control || { echo "ipk lost runtime dep $dep" >&2; exit 1; }
+          done
+          echo "--- runtime: glibc ABI tag must be 4.4.0, not 5.4.0 ---"
+          for lib in libc.so.6 libdl.so.2 libm.so.6 libpthread.so.0; do
+            arm-linux-gnueabihf-readelf -n "verify/usr/lib/zte-mesh/root/lib/$lib" | grep -q 'ABI: 4.4.0' || {
+              echo "$lib does not carry ABI tag 4.4.0:" >&2
+              arm-linux-gnueabihf-readelf -n "verify/usr/lib/zte-mesh/root/lib/$lib" >&2
+              exit 1; }
+          done
+          echo "all four libraries carry ABI tag 4.4.0"
+          echo "--- init must refuse to start on an incompatible runtime ---"
+          grep -q 'runtime_ready' verify/etc/init.d/zte-mesh || {
+            echo "init has no runtime_ready preflight" >&2; exit 1; }
+          echo "--- LuCI must be the Lua pages, not the JS view ---"
+          LUCI_IPK=$(find dist -name 'luci-app-zte-mesh_[0-9]*.ipk' | head -1)
+          ( cd verify && rm -rf luci && mkdir luci && cd luci && tar -xzf "../../$LUCI_IPK" && tar -xzf data.tar.gz )
+          test -f verify/luci/usr/lib/lua/luci/controller/zte-mesh.lua || {
+            echo "luci-app ipk has no Lua controller" >&2; exit 1; }
+          # The rpcd acl is also named luci-app-zte-mesh.json, so name the
+          # two modern files by their paths instead of by basename: the JS
+          # view and the menu.d entry must both be gone.
+          if [ -e verify/luci/usr/share/luci/menu.d/luci-app-zte-mesh.json ] || \
+             find verify/luci -name 'zte-mesh.js' | grep -q .; then
+            echo "luci-app ipk still carries the JS view / menu.d entry" >&2; exit 1; fi
+          echo "luci-app ipk carries the Lua controller and no JS view"
+          echo "--- loader --list under qemu (does not replace the real 4.4.60 check) ---"
+          # qemu sees the host kernel, so this only proves the loader and
+          # its libraries resolve -- the real kernel-version check still
+          # belongs on the router (legacy/19.07/README.md).
+          for prog in db-engine-probe multiapd zte-meshctl; do
+            qemu-arm-static verify/usr/lib/zte-mesh/root/lib/ld-linux.so.3 \
+              --library-path verify/usr/lib/zte-mesh/root/lib \
+              --list "verify/usr/lib/zte-mesh/root/bin/$prog" > /dev/null 2>&1 || {
+              echo "loader --list failed for $prog" >&2; exit 1; }
+          done
+          echo "loader --list: db-engine-probe, multiapd, zte-meshctl all resolve"
+
+      - name: Upload build log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-ipk-log
+          path: build-ipk.log
+          if-no-files-found: ignore
+
+      - name: Summarise the batch
+        if: always()
+        run: |
+          {
+            echo "### zte-mesh legacy ipk batch ${{ github.sha }}"
+            echo
+            echo '```'
+            ls -l dist 2>/dev/null || echo "no dist/"
+            cat dist/SHA256SUMS.txt 2>/dev/null || true
+            echo '```'
+            echo
+            echo "Install on the 19.07 router with opkg (see legacy/19.07/README.md),"
+            echo "clear /tmp/luci-indexcache after installing, and check the loader"
+            echo "--list on the router itself: qemu cannot stand in for kernel 4.4.60."
+          } >> "$GITHUB_STEP_SUMMARY"
